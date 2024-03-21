@@ -372,7 +372,7 @@ query_node_props(Nodes) when Nodes =/= [] ->
     %% By using a temporary intermediate hidden node, we ask Erlang not to
     %% connect everyone automatically.
     Context = rabbit_prelaunch:get_context(),
-    VMArgs0 = ["-hidden"],
+    VMArgs0 = ["+pc","unicode","-hidden"],
     VMArgs1 = case init:get_argument(boot) of
                   {ok, [[BootFileArg]]} ->
                       ["-boot", BootFileArg | VMArgs0];
@@ -455,7 +455,7 @@ maybe_add_inetrc_arguments1(VMArgs, Val) ->
     %% The filename argument must be passed as a quoted string so that the
     %% command line is correctly parsed as an Erlang string by the temporary
     %% hidden node.
-    ValString = rabbit_misc:format("~0p", [Val]),
+    ValString = rabbit_misc:format("~0p", [unicode:characters_to_list(Val)]),
     ["-kernel", "inetrc", ValString | VMArgs].
 
 maybe_add_tls_arguments(VMArgs) ->
@@ -511,7 +511,8 @@ maybe_add_tls_arguments(VMArgs) ->
     %%     "no_dot_erlang","-hidden"],
     VMArgs1 = case init:get_argument(ssl_dist_opt) of
                   {ok, SslDistOpts0} ->
-                      SslDistOpts1 = [["-ssl_dist_opt" | SslDistOpt]
+                      SslDistOpts1 = [["-ssl_dist_opt" |
+                                       unicode:characters_to_list(SslDistOpt)]
                                       || SslDistOpt <- SslDistOpts0],
                       SslDistOpts2 = lists:concat(SslDistOpts1),
                       SslDistOpts2 ++ VMArgs;
@@ -528,7 +529,8 @@ maybe_add_tls_arguments(VMArgs) ->
     %% argument list.
     VMArgs2 = case init:get_argument(ssl_dist_optfile) of
                   {ok, [[SslDistOptfileArg]]} ->
-                      ["-ssl_dist_optfile", SslDistOptfileArg | VMArgs1];
+                      ["-ssl_dist_optfile",
+                       unicode:characters_to_list(SslDistOptfileArg) | VMArgs1];
                   _ ->
                       VMArgs1
               end,
