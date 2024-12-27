@@ -662,6 +662,7 @@ handle_cast(terminate, State = #ch{cfg = #conf{writer_pid = WriterPid}}) ->
     {stop, normal, State};
 
 handle_cast({command, #'basic.consume_ok'{consumer_tag = CTag} = Msg}, State) ->
+    timer:sleep(1000), %% rabbitmq-dotnet-client-1750
     ok = send(Msg, State),
     noreply(consumer_monitor(CTag, State));
 
