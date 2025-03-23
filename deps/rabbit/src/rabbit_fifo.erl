@@ -43,6 +43,7 @@
          apply/3,
          state_enter/2,
          tick/2,
+         live_indexes/1,
          overview/1,
 
          get_checked_out/4,
@@ -77,7 +78,7 @@
          get_msg/1,
 
          %% protocol helpers
-         make_enqueue/3,
+         make_enqueue/4,
          make_register_enqueuer/1,
          make_checkout/3,
          make_settle/2,
@@ -104,6 +105,7 @@
 
 -import(serial_number, [add/2, diff/2]).
 -define(ENQ_V2, e).
+-define(ENQ_V3, e3).
 
 %% command records representing all the protocol actions that are supported
 -record(enqueue, {pid :: option(pid()),
@@ -113,6 +115,11 @@
                   msg :: raw_msg(),
                   size :: {MetadataSize :: non_neg_integer(),
                            PayloadSize :: non_neg_integer()}}).
+-record(?ENQ_V3, {seq :: option(msg_seqno()),
+                  msg :: raw_msg(),
+                  size :: {MetadataSize :: non_neg_integer(),
+                           PayloadSize :: non_neg_integer()},
+                  meta :: msg_metadata()}).
 -record(requeue, {consumer_key :: consumer_key(),
                   msg_id :: msg_id(),
                   index :: ra:index(),
@@ -146,6 +153,7 @@
 -opaque protocol() ::
     #enqueue{} |
     #?ENQ_V2{} |
+    #?ENQ_V3{} |
     #requeue{} |
     #register_enqueuer{} |
     #checkout{} |
@@ -189,8 +197,15 @@
 -spec init(config()) -> state().
 init(#{name := Name,
        queue_resource := Resource} = Conf) ->
-    update_config(Conf, #?STATE{cfg = #cfg{name = Name,
-                                           resource = Resource}}).
+    State = update_config(Conf, #?STATE{cfg = #cfg{name = Name,
+                                                   resource = Resource}}),
+    case State#?STATE.cfg#cfg.filter_enabled of
+        true ->
+            State#?STATE{messages = rabbit_fifo_filter_q:new(),
+                         returns = gb_trees:empty()};
+        false ->
+            State
+    end.
 
 update_config(Conf, State) ->
     DLH = maps:get(dead_letter_handler, Conf, undefined),
@@ -214,6 +229,7 @@ update_config(Conf, State) ->
                            false ->
                                competing
                        end,
+    FilterEnabled = maps:get(filter_enabled, Conf, false),
     Cfg = State#?STATE.cfg,
 
     LastActive = maps:get(created, Conf, undefined),
@@ -225,7 +241,8 @@ update_config(Conf, State) ->
                                consumer_strategy = ConsumerStrategy,
                                delivery_limit = DeliveryLimit,
                                expires = Expires,
-                               msg_ttl = MsgTTL},
+                               msg_ttl = MsgTTL,
+                               filter_enabled = FilterEnabled},
                  last_active = LastActive}.
 
 % msg_ids are scoped per consumer
@@ -235,10 +252,17 @@ update_config(Conf, State) ->
     {state(), ra_machine:reply()}.
 apply(Meta, #enqueue{pid = From, seq = Seq,
                      msg = RawMsg}, State00) ->
-    apply_enqueue(Meta, From, Seq, RawMsg, message_size(RawMsg), State00);
+    apply_enqueue(Meta, From, Seq, RawMsg, message_size(RawMsg), #{}, State00);
 apply(#{reply_mode := {notify, _Corr, EnqPid}} = Meta,
       #?ENQ_V2{seq = Seq, msg = RawMsg, size = Size}, State00) ->
-    apply_enqueue(Meta, EnqPid, Seq, RawMsg, Size, State00);
+    apply_enqueue(Meta, EnqPid, Seq, RawMsg, Size, #{}, State00);
+apply(Meta, #?ENQ_V3{seq = undefined = Seq,
+                     msg = RawMsg, size = Size, meta = MsgMeta}, State) ->
+    EnqPid = undefined,
+    apply_enqueue(Meta, EnqPid, Seq, RawMsg, Size, MsgMeta, State);
+apply(#{reply_mode := {notify, _Corr, EnqPid}} = Meta,
+      #?ENQ_V3{seq = Seq, msg = RawMsg, size = Size, meta = MsgMeta}, State00) ->
+    apply_enqueue(Meta, EnqPid, Seq, RawMsg, Size, MsgMeta, State00);
 apply(_Meta, #register_enqueuer{pid = Pid},
       #?STATE{enqueuers = Enqueuers0,
               cfg = #cfg{overflow_strategy = Overflow}} = State0) ->
@@ -382,7 +406,7 @@ apply(#{index := Index,
             %% a dequeue using the same consumer_id isn't possible at this point
             {State0, {dequeue, empty}};
         _ ->
-            {_, State1} = update_consumer(Meta, ConsumerId, ConsumerId, ConsumerMeta,
+            {_, State1} = upsert_consumer(Meta, ConsumerId, ConsumerId, ConsumerMeta,
                                           {once, {simple_prefetch, 1}}, 0,
                                           State0),
             case checkout_one(Meta, false, State1, []) of
@@ -408,9 +432,7 @@ apply(#{index := Index,
                     {State,  '$ra_no_reply', Effects};
                 {nochange, _ExpiredMsg = true, State2, Effects0} ->
                     %% All ready messages expired.
-                    State3 = State2#?STATE{consumers =
-                                           maps:remove(ConsumerId,
-                                                       State2#?STATE.consumers)},
+                    State3 = remove_consumer(ConsumerId, State2),
                     {State, _, Effects} = evaluate_limit(Index, false, State0,
                                                          State3, Effects0),
                     {State, {dequeue, empty}, Effects}
@@ -459,7 +481,7 @@ apply(#{index := Idx} = Meta,
                       error ->
                           ConsumerId
                   end,
-    {Consumer, State1} = update_consumer(Meta, ConsumerKey, ConsumerId,
+    {Consumer, State1} = upsert_consumer(Meta, ConsumerKey, ConsumerId,
                                          ConsumerMeta, Spec, Priority, State0),
     {State2, Effs} = activate_next_consumer(State1, []),
     #consumer{checked_out = Checked,
@@ -476,8 +498,9 @@ apply(#{index := Idx} = Meta,
                    num_checked_out => map_size(Checked)}},
     checkout(Meta, State0, State2, [{monitor, process, Pid} | Effs], Reply);
 apply(#{index := Index}, #purge{},
-      #?STATE{messages_total = Total,
-              returns = Returns,
+      #?STATE{cfg = #cfg{filter_enabled = FilterEnabled},
+              messages_total = Total,
+              returns = Returns0,
               ra_indexes = Indexes0
              } = State0) ->
     NumReady = messages_ready(State0),
@@ -488,7 +511,7 @@ apply(#{index := Index}, #purge{},
                       %% No message is awaiting acknowledgement.
                       %% Optimization: empty all 'ra_indexes'.
                       rabbit_fifo_index:empty();
-                  _ ->
+                  _ when not FilterEnabled ->
                       %% Some messages are checked out to consumers
                       %% awaiting acknowledgement.
                       %% Therefore we cannot empty all 'ra_indexes'.
@@ -497,14 +520,22 @@ apply(#{index := Index}, #purge{},
                       %% not part of the 'ra_indexes'.
                       lqueue:fold(fun(?MSG(I, _), Acc) ->
                                           rabbit_fifo_index:delete(I, Acc)
-                                  end, Indexes0, Returns)
+                                  end, Indexes0, Returns0);
+                  _ ->
+                      Indexes0
               end,
+    {Messages, Returns} = case FilterEnabled of
+                              true ->
+                                  {rabbit_fifo_filter_q:new(), gb_trees:empty()};
+                              false ->
+                                  {rabbit_fifo_q:new(), lqueue:new()}
+                          end,
     State1 = State0#?STATE{ra_indexes = Indexes,
-                           messages = rabbit_fifo_q:new(),
+                           messages = Messages,
                            messages_total = Total - NumReady,
-                           returns = lqueue:new(),
-                           msg_bytes_enqueue = 0
-                          },
+                           returns = Returns,
+                           filter_msgs_expiry = gb_trees:empty(),
+                           msg_bytes_enqueue = 0},
     Effects0 = [{aux, force_checkpoint}, garbage_collection],
     Reply = {purge, NumReady},
     {State, _, Effects} = evaluate_limit(Index, false, State0,
@@ -512,8 +543,15 @@ apply(#{index := Index}, #purge{},
     {State, Reply, Effects};
 apply(#{index := _Idx}, #garbage_collection{}, State) ->
     {State, ok, [{aux, garbage_collection}]};
-apply(Meta, {timeout, expire_msgs}, State) ->
-    checkout(Meta, State, State, []);
+apply(Meta = #{system_time := Ts}, {timeout, expire_msgs},
+      State0 = #?STATE{cfg = #cfg{filter_enabled = FilterEnabled}}) ->
+    case FilterEnabled of
+        true ->
+            {State, Effects} = filter_expire_msgs(Ts, State0, []),
+            {State, ok, lists:reverse(Effects)};
+        false ->
+            checkout(Meta, State0, State0, [])
+    end;
 apply(#{system_time := Ts} = Meta,
       {down, Pid, noconnection},
       #?STATE{consumers = Cons0,
@@ -531,19 +569,19 @@ apply(#{system_time := Ts} = Meta,
                   %% and checked out messages should be returned
                   Effs = consumer_update_active_effects(
                            S0, C0, false, suspected_down, E0),
-                  {St, Effs1} = return_all(Meta, S0, Effs, CKey, C0, true),
+                  {S1, Effs1} = return_all(Meta, S0, Effs, CKey, C0, true),
                   %% if the consumer was cancelled there is a chance it got
                   %% removed when returning hence we need to be defensive here
-                  Waiting = case St#?STATE.consumers of
+                  Waiting = case S1#?STATE.consumers of
                                 #{CKey := C} ->
                                     Waiting0 ++ [{CKey, C}];
                                 _ ->
                                     Waiting0
                             end,
-                  {St#?STATE{consumers = maps:remove(CKey, St#?STATE.consumers),
-                             waiting_consumers = Waiting,
-                             last_active = Ts},
-                   Effs1};
+                  S2 = remove_consumer(CKey, S1),
+                  S = S2#?STATE{waiting_consumers = Waiting,
+                                last_active = Ts},
+                  {S, Effs1};
              (_, _, S) ->
                   S
           end, {State0, []}, maps:iterator(Cons0, ordered)),
@@ -843,13 +881,32 @@ tick(Ts, #?STATE{cfg = #cfg{resource = QName}} = State) ->
             [{aux, {handle_tick, [QName, overview(State), all_nodes(State)]}}]
     end.
 
+-spec live_indexes(state()) -> [ra:index()].
+live_indexes(#?STATE{cfg = #cfg{filter_enabled = true},
+                     messages = Messages,
+                     ra_indexes = Indexes,
+                     dlx = DlxState}) ->
+    {Size0, Idxs0} = rabbit_fifo_filter_q:ra_indexes(Messages),
+    {Size1, Idxs1} = rabbit_fifo_dlx:raft_indexes(DlxState),
+    Size2 = rabbit_fifo_index:size(Indexes),
+    Idxs2 = rabbit_fifo_index:to_list(Indexes),
+    %% Avoid copying the longest list
+    case max(max(Size0, Size1), Size2) of
+        Size0 -> Idxs1 ++ (Idxs2 ++ Idxs0);
+        Size1 -> Idxs0 ++ (Idxs2 ++ Idxs1);
+        Size2 -> Idxs0 ++ (Idxs1 ++ Idxs2)
+    end;
+live_indexes(#?STATE{cfg = #cfg{filter_enabled = false}}) ->
+    %%TODO is this correct?
+    [].
+
 -spec overview(state()) -> map().
 overview(#?STATE{consumers = Cons,
                  enqueuers = Enqs,
                  enqueue_count = EnqCount,
                  msg_bytes_enqueue = EnqueueBytes,
                  msg_bytes_checkout = CheckoutBytes,
-                 cfg = Cfg,
+                 cfg = #cfg{filter_enabled = FilterEnabled} = Cfg,
                  dlx = DlxState,
                  messages = Messages,
                  returns = Returns,
@@ -876,10 +933,16 @@ overview(#?STATE{consumers = Cons,
                       _ ->
                           #{}
                   end,
-    MsgsRet = lqueue:len(Returns),
-    #{num_hi := MsgsHi,
-      num_no := MsgsNo} = rabbit_fifo_q:overview(Messages),
-
+    {#{num_hi := MsgsHi,
+       num_no := MsgsNo},
+     MsgsRet} = case FilterEnabled of
+                    true ->
+                        {rabbit_fifo_filter_q:overview(Messages),
+                         gb_trees:size(Returns)};
+                    false ->
+                        {rabbit_fifo_q:overview(Messages),
+                         lqueue:len(Returns)}
+                end,
     Overview = #{type => ?STATE,
                  config => Conf,
                  num_consumers => map_size(Cons),
@@ -1013,7 +1076,8 @@ handle_aux(_RaftState, cast, {#return{msg_ids = MsgIds,
                                       consumer_key = Key} = Ret, Corr, Pid},
            Aux0, RaAux0) ->
     case ra_aux:machine_state(RaAux0) of
-        #?STATE{cfg = #cfg{delivery_limit = undefined},
+        #?STATE{cfg = #cfg{delivery_limit = undefined,
+                           filter_enabled = false},
                 consumers = Consumers} ->
             case find_consumer(Key, Consumers) of
                 {ConsumerKey, #consumer{checked_out = Checked}} ->
@@ -1038,7 +1102,9 @@ handle_aux(_RaftState, cast, {#return{msg_ids = MsgIds,
                     {no_reply, Aux0, RaAux0}
             end;
         _ ->
-            %% for returns with a delivery limit set we can just return as before
+            %% Return the message to the head of the queue if:
+            %% * delivery limit is set, or
+            %% * filtering is enabled since log compaction is then also enabled
             {no_reply, Aux0, RaAux0, [{append, Ret, {notify, Corr, Pid}}]}
     end;
 handle_aux(leader, _, {handle_tick, [QName, Overview0, Nodes]},
@@ -1197,10 +1263,8 @@ process_is_alive(_) ->
 query_messages_ready(State) ->
     messages_ready(State).
 
-query_messages_checked_out(#?STATE{consumers = Consumers}) ->
-    maps:fold(fun (_, #consumer{checked_out = C}, S) ->
-                      maps:size(C) + S
-              end, 0, Consumers).
+query_messages_checked_out(State) ->
+    num_checked_out(State).
 
 query_messages_total(State) ->
     messages_total(State).
@@ -1356,8 +1420,15 @@ is_v4() ->
     %% Quorum queue v4 is introduced in RabbitMQ 4.0.0
     rabbit_feature_flags:is_enabled('rabbitmq_4.0.0').
 
+is_v5() ->
+    rabbit_feature_flags:is_enabled('rabbitmq_4.2.0').
+
 %%% Internal
 
+messages_ready(#?STATE{cfg = #cfg{filter_enabled = true},
+                       messages = M,
+                       returns = R}) ->
+    rabbit_fifo_filter_q:size(M) + gb_trees:size(R);
 messages_ready(#?STATE{messages = M,
                        returns = R}) ->
     rabbit_fifo_q:len(M) + lqueue:len(R).
@@ -1476,7 +1547,10 @@ activate_next_consumer(#?STATE{cfg = #cfg{consumer_strategy = competing}} = Stat
                        Effects) ->
     {State, Effects};
 activate_next_consumer(#?STATE{consumers = Cons0,
-                               waiting_consumers = Waiting0} = State0,
+                               waiting_consumers = Waiting0,
+                               messages = Messages,
+                               return_count = ReturnCount
+                              } = State0,
                        Effects0) ->
     %% invariant, the waiting list always need to be sorted by consumers that are
     %% up - then by priority
@@ -1502,9 +1576,8 @@ activate_next_consumer(#?STATE{consumers = Cons0,
                                Existing#consumer{cfg =  NextCCfg}
                        end,
             #?STATE{service_queue = ServiceQueue} = State0,
-            ServiceQueue1 = maybe_queue_consumer(NextCKey,
-                                                 Consumer,
-                                                 ServiceQueue),
+            ServiceQueue1 = maybe_queue_consumer(NextCKey, Consumer, ServiceQueue,
+                                                 false, Messages, ReturnCount),
             State = State0#?STATE{consumers = Cons0#{NextCKey => Consumer},
                                   service_queue = ServiceQueue1,
                                   waiting_consumers = Remaining},
@@ -1513,7 +1586,7 @@ activate_next_consumer(#?STATE{consumers = Cons0,
                                                      Effects0),
             {State, Effects};
         {{ActiveCKey, ?CONSUMER_PRIORITY(ActivePriority) =
-                      #consumer{checked_out = ActiveChecked} = Active},
+          #consumer{checked_out = ActiveChecked} = Active},
          {NextCKey, ?CONSUMER_PRIORITY(WaitingPriority) = Consumer}}
           when WaitingPriority > ActivePriority andalso
                map_size(ActiveChecked) == 0 ->
@@ -1521,9 +1594,8 @@ activate_next_consumer(#?STATE{consumers = Cons0,
             %% the next consumer is a higher priority and should take over
             %% and this consumer does not have any pending messages
             #?STATE{service_queue = ServiceQueue} = State0,
-            ServiceQueue1 = maybe_queue_consumer(NextCKey,
-                                                 Consumer,
-                                                 ServiceQueue),
+            ServiceQueue1 = maybe_queue_consumer(NextCKey, Consumer, ServiceQueue,
+                                                 false, Messages, ReturnCount),
             Cons1 = Cons0#{NextCKey => Consumer},
             Cons = maps:remove(ActiveCKey, Cons1),
             Waiting = add_waiting({ActiveCKey, Active}, Remaining),
@@ -1580,24 +1652,68 @@ maybe_return_all(#{system_time := Ts} = Meta, ConsumerKey,
         _ ->
             {S1, Effects} = return_all(Meta, S0, Effects0, ConsumerKey,
                                        Consumer, Reason == down),
-            {S1#?STATE{consumers = maps:remove(ConsumerKey, S1#?STATE.consumers),
-                       last_active = Ts},
-             Effects}
+            S2 = remove_consumer(ConsumerKey, S1),
+            S = S2#?STATE{last_active = Ts},
+            {S, Effects}
     end.
 
 apply_enqueue(#{index := RaftIdx,
                 system_time := Ts} = Meta, From,
-              Seq, RawMsg, Size, State0) ->
+              Seq, RawMsg, Size, MsgMeta, State0) ->
     Effects0 = [{aux, {bytes_in, Size}}],
-    case maybe_enqueue(RaftIdx, Ts, From, Seq, RawMsg, Size,
-                       Effects0, State0) of
+    case maybe_enqueue(RaftIdx, Ts, From, Seq, RawMsg,
+                       Size, MsgMeta, Effects0, State0) of
         {ok, State1, Effects1} ->
-            checkout(Meta, State0, State1, Effects1);
+            State = queue_filtering_consumers(Meta, State1),
+            checkout(Meta, State0, State, Effects1);
         {out_of_sequence, State, Effects} ->
             {State, not_enqueued, Effects};
         {duplicate, State, Effects} ->
             {State, ok, Effects}
     end.
+
+%% Ensure that any filtering consumers who previously scanned up to the end
+%% of the queue get re-added to the service queue.
+%%
+%% This must be fast because it's called after each enqueue.
+%% Specifically, the following should all be avoided:
+%% * map insertions or deletions
+%% * building a new list of consumers
+%% * expensive priority_queue:member/2 calls
+%%
+%% Therefore, we simply add all active consumers here. During checkout,
+%% any consumers that are down or have 0 credits will be removed anyway.
+queue_filtering_consumers(Meta, #?STATE{cfg = #cfg{filter_enabled = true},
+                                        consumers_queue = ConsumersQ,
+                                        msg_bytes_enqueue = BytesEnq} = State) ->
+    #{system_time := Ts,
+      index := Idx} = Meta,
+    %% Rotating helps dispatching messages across multiple consumers.
+    %% Note however that this doesn't guarantee round robin.
+    %% We add some randomness as to whether we rotate to break certain patterns
+    %% where the same consumers would get all messages assigned.
+    %% Example: Empty queue with two consumers 1 and 2 both filtering only group A
+    %% and both having granted lots of credits.
+    %% New messages are enqueued in the following order for the following groups:
+    %% A, B, A, B, and so on...
+    %% Without randomness consumer 1 will get all the messages while consumer 2
+    %% won't get a single message.
+    %%
+    %% We could use module `rand` initialised with the same seed and algorithm
+    %% on all QQ members. However, there are still minor risks of non-determinism
+    %% across OTP versions. We also don't need good statistical properties.
+    %% Therefore, the following sources of randomness should be good enough.
+    ShouldRotate = (Ts + Idx + BytesEnq) rem 5 =/= 0,
+    NewConsumersQ = case ShouldRotate of
+                        true ->
+                            priority_queue:rotate(ConsumersQ);
+                        false ->
+                            ConsumersQ
+                    end,
+    State#?STATE{service_queue = ConsumersQ,
+                 consumers_queue = NewConsumersQ};
+queue_filtering_consumers(_Meta, State) ->
+    State.
 
 decr_total(#?STATE{messages_total = Tot} = State) ->
     State#?STATE{messages_total = Tot - 1}.
@@ -1675,43 +1791,32 @@ update_expiry_header(ExpiryTs, Header) ->
     update_header(expiry, fun(Ts) -> Ts end, ExpiryTs, Header).
 
 maybe_enqueue(RaftIdx, Ts, undefined, undefined, RawMsg,
-              {_MetaSize, BodySize},
+              {_MetaSize, BodySize} = Size, MsgMeta,
               Effects, #?STATE{msg_bytes_enqueue = Enqueue,
                                enqueue_count = EnqCount,
-                               messages = Messages,
                                messages_total = Total} = State0) ->
     % direct enqueue without tracking
-    Size = BodySize,
-    Header0 = maybe_set_msg_ttl(RawMsg, Ts, BodySize, State0),
-    Header = maybe_set_msg_delivery_count(RawMsg, Header0),
-    Msg = ?MSG(RaftIdx, Header),
-    PTag = priority_tag(RawMsg),
-    State = State0#?STATE{msg_bytes_enqueue = Enqueue + Size,
+    State1 = enqueue(RaftIdx, Ts, RawMsg, Size, MsgMeta, State0),
+    State = State1#?STATE{msg_bytes_enqueue = Enqueue + BodySize,
                           enqueue_count = EnqCount + 1,
-                          messages_total = Total + 1,
-                          messages = rabbit_fifo_q:in(PTag, Msg, Messages)
-                         },
+                          messages_total = Total + 1},
     {ok, State, Effects};
 maybe_enqueue(RaftIdx, Ts, From, MsgSeqNo, RawMsg,
-              {_MetaSize, BodySize} = Size,
+              {_MetaSize, BodySize} = Size, MsgMeta,
               Effects0, #?STATE{msg_bytes_enqueue = Enqueue,
                                 enqueue_count = EnqCount,
                                 enqueuers = Enqueuers0,
-                                messages = Messages,
                                 messages_total = Total} = State0) ->
 
     case maps:get(From, Enqueuers0, undefined) of
         undefined ->
             State1 = State0#?STATE{enqueuers = Enqueuers0#{From => #enqueuer{}}},
             {Res, State, Effects} = maybe_enqueue(RaftIdx, Ts, From, MsgSeqNo,
-                                                  RawMsg, Size, Effects0,
+                                                  RawMsg, Size, MsgMeta, Effects0,
                                                   State1),
             {Res, State, [{monitor, process, From} | Effects]};
         #enqueuer{next_seqno = MsgSeqNo} = Enq0 ->
             % it is the next expected seqno
-            Header0 = maybe_set_msg_ttl(RawMsg, Ts, BodySize, State0),
-            Header = maybe_set_msg_delivery_count(RawMsg, Header0),
-            Msg = ?MSG(RaftIdx, Header),
             Enq = Enq0#enqueuer{next_seqno = MsgSeqNo + 1},
             MsgCache = case can_immediately_deliver(State0) of
                            true ->
@@ -1719,11 +1824,10 @@ maybe_enqueue(RaftIdx, Ts, From, MsgSeqNo, RawMsg,
                            false ->
                                undefined
                        end,
-            PTag = priority_tag(RawMsg),
-            State = State0#?STATE{msg_bytes_enqueue = Enqueue + BodySize,
+            State1 = enqueue(RaftIdx, Ts, RawMsg, Size, MsgMeta, State0),
+            State = State1#?STATE{msg_bytes_enqueue = Enqueue + BodySize,
                                   enqueue_count = EnqCount + 1,
                                   messages_total = Total + 1,
-                                  messages = rabbit_fifo_q:in(PTag, Msg, Messages),
                                   enqueuers = Enqueuers0#{From => Enq},
                                   msg_cache = MsgCache
                                  },
@@ -1737,28 +1841,50 @@ maybe_enqueue(RaftIdx, Ts, From, MsgSeqNo, RawMsg,
             {duplicate, State0, Effects0}
     end.
 
+enqueue(Idx, Ts, RawMsg, {_MetaSize, BodySize}, MsgMeta,
+        State = #?STATE{cfg = #cfg{filter_enabled = true},
+                        messages = Messages,
+                        filter_msgs_expiry = Expiry0}) ->
+    Header0 = #{size => BodySize,
+                meta => MsgMeta},
+    Header1 = maybe_set_msg_ttl(RawMsg, Ts, Header0, State),
+    Header = maybe_set_msg_delivery_count(RawMsg, Header1),
+    Prio = priority_tag(RawMsg),
+    Expiry = insert_filter_msgs_expiry(Idx, Header, Prio, Expiry0),
+    Msg = ?MSG(Idx, Header),
+    State#?STATE{messages = rabbit_fifo_filter_q:in(Prio, Msg, Messages),
+                 filter_msgs_expiry = Expiry};
+enqueue(Idx, Ts, RawMsg, {_MetaSize, BodySize}, _MsgMeta,
+        State = #?STATE{messages = Messages}) ->
+    Header0 = maybe_set_msg_ttl(RawMsg, Ts, BodySize, State),
+    Header = maybe_set_msg_delivery_count(RawMsg, Header0),
+    Msg = ?MSG(Idx, Header),
+    Prio = priority_tag(RawMsg),
+    State#?STATE{messages = rabbit_fifo_q:in(Prio, Msg, Messages)}.
+
 return(#{} = Meta, ConsumerKey, MsgIds, IncrDelCount, Anns,
        Checked, Effects0, State0)
- when is_map(Anns) ->
+  when is_map(Anns) ->
     %% We requeue in the same order as messages got returned by the client.
     {State1, Effects1} =
-        lists:foldl(
-          fun(MsgId, Acc = {S0, E0}) ->
-                  case Checked of
-                      #{MsgId := Msg} ->
-                          return_one(Meta, MsgId, Msg, IncrDelCount, Anns,
-                                     S0, E0, ConsumerKey);
-                      #{} ->
-                          Acc
-                  end
-          end, {State0, Effects0}, MsgIds),
+    lists:foldl(
+      fun(MsgId, Acc = {S0, E0}) ->
+              case Checked of
+                  #{MsgId := Msg} ->
+                      return_one(Meta, MsgId, Msg, IncrDelCount, Anns,
+                                 S0, E0, ConsumerKey);
+                  #{} ->
+                      Acc
+              end
+      end, {State0, Effects0}, MsgIds),
     State2 = case State1#?STATE.consumers of
                  #{ConsumerKey := Con} ->
                      update_or_remove_con(Meta, ConsumerKey, Con, State1);
                  _ ->
                      State1
              end,
-    checkout(Meta, State0, State2, Effects1).
+    State3 = queue_filtering_consumers(Meta, State2),
+    checkout(Meta, State0, State3, Effects1).
 
 % used to process messages that are finished
 complete(Meta, ConsumerKey, [MsgId],
@@ -1895,11 +2021,14 @@ annotate_msg(Header, Msg0) ->
             Msg0
     end.
 
-return_one(Meta, MsgId, ?MSG(_, _) = Msg0, DelivFailed, Anns,
-           #?STATE{returns = Returns,
+return_one(Meta, MsgId, ?MSG(Idx, _) = Msg0, DelivFailed, Anns,
+           #?STATE{returns = Returns0,
+                   return_count = ReturnCount0,
+                   filter_msgs_expiry = Expiry0,
                    consumers = Consumers,
                    dlx = DlxState0,
-                   cfg = #cfg{delivery_limit = DeliveryLimit,
+                   cfg = #cfg{filter_enabled = FilterEnabled,
+                              delivery_limit = DeliveryLimit,
                               dead_letter_handler = DLH}} = State0,
            Effects0, ConsumerKey) ->
     #consumer{checked_out = Checked0} = Con0 = maps:get(ConsumerKey, Consumers),
@@ -1916,20 +2045,33 @@ return_one(Meta, MsgId, ?MSG(_, _) = Msg0, DelivFailed, Anns,
             Checked = maps:remove(MsgId, Checked0),
             Con = Con0#consumer{checked_out = Checked,
                                 credit = increase_credit(Con0, 1)},
-            {add_bytes_return(
-               Header,
-               State0#?STATE{consumers = Consumers#{ConsumerKey => Con},
-                             returns = lqueue:in(Msg, Returns)}),
-             Effects0}
+            ReturnCount = ReturnCount0 + 1,
+            {Returns, Expiry} = case FilterEnabled of
+                                    true ->
+                                        {gb_trees:insert(ReturnCount, Msg, Returns0),
+                                         insert_filter_msgs_expiry(Idx, Header,
+                                                                   ReturnCount, Expiry0)};
+                                    false ->
+                                        {lqueue:in(Msg, Returns0), Expiry0}
+                                end,
+            State1 = State0#?STATE{consumers = Consumers#{ConsumerKey := Con},
+                                   returns = Returns,
+                                   return_count = ReturnCount,
+                                   filter_msgs_expiry = Expiry},
+            State = add_bytes_return(Header, State1),
+            {State, Effects0}
     end.
 
 return_all(Meta, #?STATE{consumers = Cons} = State0, Effects0, ConsumerKey,
            #consumer{checked_out = Checked} = Con, DelivFailed) ->
-    State = State0#?STATE{consumers = Cons#{ConsumerKey => Con}},
-    lists:foldl(fun ({MsgId, Msg}, {S, E}) ->
-                        return_one(Meta, MsgId, Msg, DelivFailed, #{},
-                                   S, E, ConsumerKey)
-                end, {State, Effects0}, lists:sort(maps:to_list(Checked))).
+    State1 = State0#?STATE{consumers = Cons#{ConsumerKey => Con}},
+    {State2, Effects} = lists:foldl(
+                          fun ({MsgId, Msg}, {S, E}) ->
+                                  return_one(Meta, MsgId, Msg, DelivFailed, #{},
+                                             S, E, ConsumerKey)
+                          end, {State1, Effects0}, lists:sort(maps:to_list(Checked))),
+    State = queue_filtering_consumers(Meta, State2),
+    {State, Effects}.
 
 checkout(Meta, OldState, State0, Effects0) ->
     checkout(Meta, OldState, State0, Effects0, ok).
@@ -1959,7 +2101,7 @@ checkout0(Meta, {success, ConsumerKey, MsgId,
                   undefined ->
                       SendAcc0#{ConsumerKey => [DelMsg]};
                   LogMsgs ->
-                      SendAcc0#{ConsumerKey => [DelMsg | LogMsgs]}
+                      SendAcc0#{ConsumerKey := [DelMsg | LogMsgs]}
               end,
     checkout0(Meta, checkout_one(Meta, ExpiredMsg, State, Effects), SendAcc);
 checkout0(_Meta, {_Activity, ExpiredMsg, State0, Effects0}, SendAcc) ->
@@ -2046,17 +2188,68 @@ chunk_disk_msgs([{_MsgId, ?MSG(_RaftIdx, Header)} = Msg | Rem], Bytes,
     chunk_disk_msgs(Rem, Bytes + Size, [[Msg | CurChunk] | Chunks]).
 
 add_delivery_effects(Effects0, AccMap, _State)
-  when map_size(AccMap) == 0 ->
+  when map_size(AccMap) =:= 0 ->
     %% does this ever happen?
     Effects0;
 add_delivery_effects(Effects0, AccMap, State) ->
-     maps:fold(fun (C, DiskMsgs, Efs)
-                     when is_list(DiskMsgs) ->
-                       lists:foldl(
-                         fun (Msgs, E) ->
-                                 [delivery_effect(C, Msgs, State) | E]
-                         end, Efs, chunk_disk_msgs(DiskMsgs, 0, [[]]))
-               end, Effects0, AccMap).
+    maps:fold(fun (C, DiskMsgs, Efs) ->
+                      lists:foldl(
+                        fun (Msgs, E) ->
+                                [delivery_effect(C, Msgs, State) | E]
+                        end, Efs, chunk_disk_msgs(DiskMsgs, 0, [[]]))
+              end, Effects0, AccMap).
+
+take_next_consumer_msg(RaTs,
+                       Con0 = #consumer{cfg = #consumer_cfg{filter = Filter},
+                                        scanned_returns = ScannedReturns},
+                       State0 = #?STATE{returns = Returns0,
+                                        return_count = ReturnCount})
+  when ScannedReturns < ReturnCount ->
+    case filter_returns(RaTs, Filter, ScannedReturns, Returns0) of
+        none ->
+            Con = Con0#consumer{scanned_returns = ReturnCount},
+            take_next_consumer_msg(RaTs, Con, State0);
+        {Key, Msg} ->
+            Returns = gb_trees:delete(Key, Returns0),
+            Con = Con0#consumer{scanned_returns = Key},
+            State = State0#?MODULE{returns = Returns},
+            {Msg, Con, State}
+    end;
+take_next_consumer_msg(RaTs,
+                       Con0 = #consumer{cfg = #consumer_cfg{filter = Filter},
+                                        scanned_idxs = Idxs0},
+                       State0 = #?STATE{messages = Messages0}) ->
+    case rabbit_fifo_filter_q:take(RaTs, Filter, Idxs0, Messages0) of
+        {empty, Idxs} ->
+            Con = Con0#consumer{scanned_idxs = Idxs},
+            {empty, Con};
+        {Msg, Idxs, Messages} ->
+            Con = Con0#consumer{scanned_idxs = Idxs},
+            State = State0#?STATE{messages = Messages},
+            {Msg, Con, State}
+    end.
+
+filter_returns(RaTs, Filter, Scanned, Tree) ->
+    From = Scanned + 1,
+    Iter = gb_trees:iterator_from(From, Tree),
+    filter_returns0(RaTs, Filter, gb_trees:next(Iter)).
+
+filter_returns0(_RaTs, _Filter, none) ->
+    none;
+filter_returns0(RaTs, Filter,
+                {ReturnCount, ?MSG(_Idx, #{meta := Meta} = Hdr) = Msg, Iter}) ->
+    case rabbit_fifo:get_header(expiry, Hdr) of
+        ExpiryTs when is_integer(ExpiryTs) andalso RaTs >= ExpiryTs ->
+            %% Message expired.
+            filter_returns0(RaTs, Filter, gb_trees:next(Iter));
+        _ ->
+            case rabbit_fifo_filter:eval(Filter, Meta) of
+                true ->
+                    {ReturnCount, Msg};
+                false ->
+                    filter_returns0(RaTs, Filter, gb_trees:next(Iter))
+            end
+    end.
 
 take_next_msg(#?STATE{returns = Returns0,
                       messages = Messages0,
@@ -2124,6 +2317,86 @@ reply_log_effect(RaftIdx, MsgId, Header, Ready, From) ->
                              {dequeue, {MsgId, {Header, get_msg(Cmd)}}, Ready}}}]
      end}.
 
+checkout_one_to_consumer(#{system_time := Ts} = Meta,
+                         ExpiredMsg,
+                         #?STATE{cfg = #cfg{filter_enabled = true},
+                                 filter_msgs_expiry = Expiry0,
+                                 msg_bytes_checkout = BytesCheckout,
+                                 msg_bytes_enqueue = BytesEnqueue,
+                                 consumers = Cons} = State0,
+                         Effects,
+                         ConsumerKey) ->
+    case Cons of
+        #{ConsumerKey := #consumer{credit = Credit,
+                                   status = Status}}
+          when Credit =:= 0 orelse
+               Status =/= up ->
+            %% not an active consumer but still in the consumers
+            %% map - this can happen when draining
+            %% or when higher priority single active consumers
+            %% take over, recurse without consumer in service
+            %% queue
+            checkout_one(Meta, ExpiredMsg, State0, Effects);
+        #{ConsumerKey := #consumer{checked_out = Checked0,
+                                   next_msg_id = Next,
+                                   credit = Credit,
+                                   delivery_count = DelCnt0,
+                                   cfg = Cfg} = Con0} ->
+            case take_next_consumer_msg(Ts, Con0, State0) of
+                {empty, Con} ->
+                    State = update_or_remove_con(Meta, ConsumerKey, Con, State0),
+                    checkout_one(Meta, ExpiredMsg, State, Effects);
+                {Msg = ?MSG(Idx, Hdr), Con1, State1} ->
+                    Expiry = case get_header(expiry, Hdr) of
+                                 undefined ->
+                                     Expiry0;
+                                 ExpiryTs ->
+                                     gb_trees:delete({ExpiryTs, Idx},
+                                                     Expiry0)
+                             end,
+                    Checked = maps:put(Next, Msg, Checked0),
+                    DelCnt = case credit_api_v2(Cfg) of
+                                 true -> add(DelCnt0, 1);
+                                 false -> DelCnt0 + 1
+                             end,
+                    Con = Con1#consumer{checked_out = Checked,
+                                        next_msg_id = Next + 1,
+                                        credit = Credit - 1,
+                                        delivery_count = DelCnt},
+                    Size = get_header(size, Hdr),
+                    State2 = State1#?STATE{
+                                       filter_msgs_expiry = Expiry,
+                                       msg_bytes_checkout = BytesCheckout + Size,
+                                       msg_bytes_enqueue = BytesEnqueue - Size},
+                    State = update_or_remove_con(Meta, ConsumerKey, Con, State2),
+                    {success, ConsumerKey, Next, Msg,
+                     ExpiredMsg, State, Effects}
+            end;
+        _ ->
+            %% consumer was not active but was queued, recurse
+            checkout_one(Meta, ExpiredMsg, State0, Effects)
+    end.
+
+checkout_one(Meta, ExpiredMsg, #?STATE{cfg = #cfg{filter_enabled = true},
+                                       service_queue = SQ0,
+                                       messages = Messages0} = State0, Effects) ->
+    case messages_ready(State0) of
+        0 ->
+            {nochange, ExpiredMsg, State0, Effects};
+        _ ->
+            case priority_queue:out(SQ0) of
+                {empty, _} ->
+                    Activity = case rabbit_fifo_filter_q:size(Messages0) of
+                                   0 -> nochange;
+                                   _ -> inactive
+                               end,
+                    {Activity, ExpiredMsg, State0, Effects};
+                {{value, ConsumerKey}, SQ} ->
+                    State = State0#?STATE{service_queue = SQ},
+                    checkout_one_to_consumer(Meta, ExpiredMsg, State,
+                                             Effects, ConsumerKey)
+            end
+    end;
 checkout_one(#{system_time := Ts} = Meta, ExpiredMsg0, InitState0, Effects0) ->
     %% Before checking out any messsage to any consumer,
     %% first remove all expired messages from the head of the queue.
@@ -2228,6 +2501,74 @@ expire(RaCmdTs, State0, Effects) ->
                               MsgBytesEnqueue - get_header(size, Header)},
     expire_msgs(RaCmdTs, true, State, DlxEffects ++ Effects).
 
+insert_filter_msgs_expiry(Idx, Header, Ref, FilterMsgsExpiry) ->
+    case get_header(expiry, Header) of
+        undefined ->
+            FilterMsgsExpiry;
+        ExpiryTs ->
+            gb_trees:insert({ExpiryTs, Idx}, Ref, FilterMsgsExpiry)
+    end.
+
+filter_expire_msgs(RaCmdTs,
+                   State0 = #?STATE{cfg = #cfg{filter_enabled = true},
+                                    filter_msgs_expiry = Expiry0},
+                   Effects) ->
+    case gb_trees:is_empty(Expiry0) of
+        true ->
+            {State0, Effects};
+        false ->
+            {{ExpiryTs, Idx}, Ref, Expiry} = gb_trees:take_smallest(Expiry0),
+            case RaCmdTs >= ExpiryTs of
+                true ->
+                    State = State0#?STATE{filter_msgs_expiry = Expiry},
+                    filter_expire_msg(RaCmdTs, Idx, Ref, State, Effects);
+                false ->
+                    {State0, Effects}
+            end
+    end.
+
+filter_expire_msg(RaCmdTs, Idx, Ref,
+                  State0 = #?STATE{cfg = #cfg{dead_letter_handler = DLH},
+                                   dlx = DlxState0,
+                                   ra_indexes = Indexes0,
+                                   messages_total = Tot,
+                                   msg_bytes_enqueue = MsgBytesEnqueue0,
+                                   messages = Messages0,
+                                   returns = Returns0},
+                  Effects) ->
+    {?MSG(Idx, Hdr) = Msg, Messages, Returns} =
+    case Ref of
+        ReturnCount when is_integer(Ref) ->
+            {Msg0, Returns1} = gb_trees:take(ReturnCount, Returns0),
+            {Msg0, Messages0, Returns1};
+        Prio when is_atom(Ref) ->
+            {Msg0, Messages1} = rabbit_fifo_filter_q:take(Idx, Prio, Messages0),
+            {Msg0, Messages1, Returns0}
+    end,
+    {DlxState, DlxEffects} = rabbit_fifo_dlx:discard(
+                               [Msg], expired, DLH, DlxState0),
+    Indexes = rabbit_fifo_index:delete(Idx, Indexes0),
+    MsgBytesEnqueue = MsgBytesEnqueue0 - get_header(size, Hdr),
+    State = State0#?STATE{dlx = DlxState,
+                          ra_indexes = Indexes,
+                          messages_total = Tot - 1,
+                          msg_bytes_enqueue = MsgBytesEnqueue,
+                          messages = Messages,
+                          returns = Returns},
+    filter_expire_msgs(RaCmdTs, State, DlxEffects ++ Effects).
+
+timer_effect(RaCmdTs,
+             #?STATE{cfg = #cfg{filter_enabled = true},
+                     filter_msgs_expiry = Expiry},
+             Effects) ->
+    T = case gb_trees:is_empty(Expiry) of
+            true ->
+                infinity;
+            false ->
+                {{ExpiryTs, _Idx}, _Ref} = gb_trees:smallest(Expiry),
+                max(0, ExpiryTs - RaCmdTs)
+        end,
+    [{timer, expire_msgs, T} | Effects];
 timer_effect(RaCmdTs, State, Effects) ->
     T = case get_next_msg(State) of
             ?MSG(_, ?TUPLE(Size, Expiry))
@@ -2256,8 +2597,8 @@ update_or_remove_con(Meta, ConsumerKey,
         0 ->
             #{system_time := Ts} = Meta,
             % we're done with this consumer
-            State#?STATE{consumers = maps:remove(ConsumerKey, Cons),
-                         last_active = Ts};
+            State1 = remove_consumer(ConsumerKey, State),
+            State1#?STATE{last_active = Ts};
         _ ->
             % there are unsettled items so need to keep around
             State#?STATE{consumers = maps:put(ConsumerKey, Con, Cons)}
@@ -2267,56 +2608,99 @@ update_or_remove_con(_Meta, ConsumerKey,
                                checked_out = Checked} = Con0,
                      #?STATE{consumers = Cons,
                              waiting_consumers = Waiting} = State)
-  when map_size(Checked) == 0 ->
+  when map_size(Checked) =:= 0 ->
     Con = Con0#consumer{status = up},
     State#?STATE{consumers = maps:remove(ConsumerKey, Cons),
                  waiting_consumers = add_waiting({ConsumerKey, Con}, Waiting)};
 update_or_remove_con(_Meta, ConsumerKey,
                      #consumer{} = Con,
-                     #?STATE{consumers = Cons,
-                             service_queue = ServiceQueue} = State) ->
+                     #?STATE{cfg = #cfg{filter_enabled = FilterEnabled},
+                             consumers = Cons,
+                             service_queue = ServiceQueue,
+                             messages = Messages,
+                             return_count = ReturnCount
+                            } = State) ->
+    %%TODO On the hot path, we want maps:update/3.
     State#?STATE{consumers = maps:put(ConsumerKey, Con, Cons),
-                 service_queue = maybe_queue_consumer(ConsumerKey, Con,
-                                                      ServiceQueue)}.
+                 %%TODO This is called unnecessarily from complete/5 for AMQP 1.0 (credit_mode = credited)
+                 %% consumers that just settled a message. In this case, nothing should change
+                 %% with credit or status, hence we can omit the potentially expensive
+                 %% priority_queue:member/2 check.
+                 service_queue = maybe_queue_consumer(
+                                   ConsumerKey, Con, ServiceQueue,
+                                   FilterEnabled, Messages, ReturnCount)}.
 
+maybe_queue_consumer(Key, #consumer{credit = Credit,
+                                    scanned_idxs = Idxs,
+                                    scanned_returns = ScannedReturns,
+                                    status = up,
+                                    cfg = #consumer_cfg{priority = P}},
+                     ServiceQueue, true, Messages, ReturnCount)
+  when Credit > 0 ->
+    case ScannedReturns >= ReturnCount andalso
+         rabbit_fifo_filter_q:is_fully_scanned(Idxs, Messages) of
+        true ->
+            ServiceQueue;
+        false ->
+            queue_consumer(Key, P, ServiceQueue)
+    end;
 maybe_queue_consumer(Key, #consumer{credit = Credit,
                                     status = up,
                                     cfg = #consumer_cfg{priority = P}},
-                     ServiceQueue)
+                     ServiceQueue, false, _Messages, _ReturnCount)
   when Credit > 0 ->
+    queue_consumer(Key, P, ServiceQueue);
+maybe_queue_consumer(_Key, _Consumer, ServiceQueue,
+                     _FilterEnabled, _Messages, _ReturnCount) ->
+    ServiceQueue.
+
+queue_consumer(Key, Prio, ServiceQueue) ->
     % TODO: queue:member could surely be quite expensive, however the practical
     % number of unique consumers may not be large enough for it to matter
     case priority_queue:member(Key, ServiceQueue) of
         true ->
             ServiceQueue;
         false ->
-            priority_queue:in(Key, P, ServiceQueue)
-    end;
-maybe_queue_consumer(_Key, _Consumer, ServiceQueue) ->
-    ServiceQueue.
+            priority_queue:in(Key, Prio, ServiceQueue)
+    end.
 
-update_consumer(Meta, ConsumerKey, {Tag, Pid}, ConsumerMeta,
+upsert_consumer(Meta, ConsumerKey, {Tag, Pid}, ConsumerMeta,
                 {Life, Mode} = Spec, Priority,
-                #?STATE{cfg = #cfg{consumer_strategy = competing},
-                        consumers = Cons0} = State0) ->
-    Consumer = case Cons0 of
-                   #{ConsumerKey := #consumer{} = Consumer0} ->
-                       merge_consumer(Meta, Consumer0, ConsumerMeta,
-                                      Spec, Priority);
-                   _ ->
-                       Credit = included_credit(Mode),
-                       DeliveryCount = initial_delivery_count(Mode),
-                       #consumer{cfg = #consumer_cfg{tag = Tag,
-                                                     pid = Pid,
-                                                     lifetime = Life,
-                                                     meta = ConsumerMeta,
-                                                     priority = Priority,
-                                                     credit_mode = Mode},
-                                 credit = Credit,
-                                 delivery_count = DeliveryCount}
-               end,
-    {Consumer, update_or_remove_con(Meta, ConsumerKey, Consumer, State0)};
-update_consumer(Meta, ConsumerKey, {Tag, Pid}, ConsumerMeta,
+                #?STATE{cfg = #cfg{consumer_strategy = competing,
+                                   filter_enabled = FilterEnabled},
+                        consumers = Cons0,
+                        consumers_queue = ConsQ0} = State0) ->
+    {Consumer, ConsQ1} =
+    case Cons0 of
+        #{ConsumerKey := #consumer{} = Consumer0} ->
+            {merge_consumer(Meta, Consumer0, ConsumerMeta,
+                            Spec, Priority),
+             %% Delete consumer before adding in case priority has changed.
+             priority_queue_delete(ConsumerKey, ConsQ0)};
+        _ ->
+            Credit = included_credit(Mode),
+            DeliveryCount = initial_delivery_count(Mode),
+            Filter = maps:get(filter, ConsumerMeta, none),
+            {#consumer{cfg = #consumer_cfg{tag = Tag,
+                                           pid = Pid,
+                                           lifetime = Life,
+                                           meta = ConsumerMeta,
+                                           priority = Priority,
+                                           credit_mode = Mode,
+                                           filter = Filter},
+                       credit = Credit,
+                       delivery_count = DeliveryCount},
+             ConsQ0}
+    end,
+    ConsQ = case FilterEnabled of
+                true ->
+                    queue_consumer(ConsumerKey, Priority, ConsQ1);
+                false ->
+                    ConsQ1
+            end,
+    State = State0#?STATE{consumers_queue = ConsQ},
+    {Consumer, update_or_remove_con(Meta, ConsumerKey, Consumer, State)};
+upsert_consumer(Meta, ConsumerKey, {Tag, Pid}, ConsumerMeta,
                 {Life, Mode} = Spec, Priority,
                 #?STATE{cfg = #cfg{consumer_strategy = single_active},
                         consumers = Cons0,
@@ -2408,13 +2792,17 @@ credit_active_consumer(
   #consumer{delivery_count = DeliveryCountSnd,
             cfg = Cfg} = Con0,
   Meta,
-  #?STATE{consumers = Cons0,
-          service_queue = ServiceQueue0} = State0) ->
+  #?STATE{cfg = #cfg{filter_enabled = FilterEnabled},
+          consumers = Cons0,
+          service_queue = ServiceQueue0,
+          messages = Messages,
+          return_count = ReturnCount} = State0) ->
     LinkCreditSnd = link_credit_snd(DeliveryCountRcv, LinkCreditRcv,
                                     DeliveryCountSnd, Cfg),
     %% grant the credit
     Con1 = Con0#consumer{credit = LinkCreditSnd},
-    ServiceQueue = maybe_queue_consumer(ConsumerKey, Con1, ServiceQueue0),
+    ServiceQueue = maybe_queue_consumer(ConsumerKey, Con1, ServiceQueue0,
+                                        FilterEnabled, Messages, ReturnCount),
     State1 = State0#?STATE{service_queue = ServiceQueue,
                            consumers = maps:update(ConsumerKey, Con1, Cons0)},
     {State2, ok, Effects} = checkout(Meta, State0, State1, []),
@@ -2548,18 +2936,27 @@ is_below(undefined, _Num) ->
 is_below(Val, Num) when is_integer(Val) andalso is_integer(Num) ->
     Num =< trunc(Val * ?LOW_LIMIT).
 
--spec make_enqueue(option(pid()), option(msg_seqno()), raw_msg()) ->
+-spec make_enqueue(option(pid()), option(msg_seqno()),
+                   raw_msg(), msg_metadata()) ->
     protocol().
-make_enqueue(Pid, Seq, Msg) ->
-    case is_v4() of
-        true when is_pid(Pid) andalso
-                  is_integer(Seq) ->
-            %% more compact format
-            #?ENQ_V2{seq = Seq,
+make_enqueue(Pid, Seq, Msg, Meta) ->
+    case is_v5() of
+        true ->
+            #?ENQ_V3{seq = Seq,
                      msg = Msg,
-                     size = ?SIZE(Msg)};
-        _ ->
-            #enqueue{pid = Pid, seq = Seq, msg = Msg}
+                     size = ?SIZE(Msg),
+                     meta = Meta};
+        false ->
+            case is_v4() of
+                true when is_pid(Pid) andalso
+                          is_integer(Seq) ->
+                    %% more compact format
+                    #?ENQ_V2{seq = Seq,
+                             msg = Msg,
+                             size = ?SIZE(Msg)};
+                _ ->
+                    #enqueue{pid = Pid, seq = Seq, msg = Msg}
+            end
     end.
 
 -spec make_register_enqueuer(pid()) -> protocol().
@@ -2771,13 +3168,17 @@ convert(Meta, 4, To, State) ->
     %% no conversion needed, this version only includes a logic change
     convert(Meta, 5, To, State).
 
+smallest_raft_index(#?STATE{cfg = #cfg{filter_enabled = true}}) ->
+    %% For this spike avoid log truncation if filtering is enabled.
+    %% TODO With Ra log compaction, we will emit a list of live indexes.
+    1;
 smallest_raft_index(#?STATE{messages = Messages,
                             ra_indexes = Indexes,
                             dlx = DlxState}) ->
     SmallestDlxRaIdx = rabbit_fifo_dlx:smallest_raft_index(DlxState),
     SmallestMsgsRaIdx = rabbit_fifo_q:get_lowest_index(Messages),
     SmallestRaIdx = rabbit_fifo_index:smallest(Indexes),
-    lists:min([SmallestDlxRaIdx, SmallestMsgsRaIdx, SmallestRaIdx]).
+    min(min(SmallestDlxRaIdx, SmallestMsgsRaIdx), SmallestRaIdx).
 
 make_requeue(ConsumerKey, Notify, [{MsgId, Idx, Header, Msg}], Acc) ->
     lists:reverse([{append,
@@ -2815,6 +3216,8 @@ can_immediately_deliver(#?STATE{service_queue = SQ,
 incr(I) ->
    I + 1.
 
+get_msg(#?ENQ_V3{msg = M}) ->
+    M;
 get_msg(#?ENQ_V2{msg = M}) ->
     M;
 get_msg(#enqueue{msg = M}) ->
@@ -3062,3 +3465,21 @@ exec_read(Flru0, ReadPlan, Msgs) ->
               %% retry without segment cache
               exec_read(undefined, ReadPlan, Msgs)
     end.
+
+remove_consumer(ConsumerKey, #?STATE{cfg = #cfg{filter_enabled = FilterEnabled},
+                                     consumers = Consumers0,
+                                     consumers_queue = ConsumersQueue0} = State) ->
+    Consumers = maps:remove(ConsumerKey, Consumers0),
+    ConsumersQueue = case FilterEnabled of
+                         true ->
+                             priority_queue_delete(ConsumerKey, ConsumersQueue0);
+                         false ->
+                             ConsumersQueue0
+                     end,
+    State#?STATE{consumers = Consumers,
+                 consumers_queue = ConsumersQueue}.
+
+priority_queue_delete(Elem, Queue) ->
+    priority_queue:filter(fun(E) ->
+                                  E =/= Elem
+                          end, Queue).

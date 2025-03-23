@@ -1319,7 +1319,7 @@ entry_to_msg(Entry, Offset, #resource{kind = queue, name = QName},
     Mc = mc_amqp:init_from_stream(Entry, #{?ANN_EXCHANGE => <<>>,
                                            ?ANN_ROUTING_KEYS => [QName],
                                            <<"x-stream-offset">> => Offset}),
-    case rabbit_amqp_filtex:filter(Filter, Mc) of
+    case rabbit_amqp_filtex:eval(Filter, Mc) of
         true ->
             {Name, LocalPid, Offset, false, Mc};
         false ->
@@ -1337,7 +1337,8 @@ capabilities() ->
                                <<"ha-promote-on-shutdown">>, <<"ha-promote-on-failure">>,
                                <<"queue-master-locator">>,
                                %% Quorum policies
-                               <<"dead-letter-strategy">>, <<"target-group-size">>],
+                               <<"dead-letter-strategy">>, <<"target-group-size">>,
+                               <<"filter-field-names">>],
       queue_arguments => [<<"x-max-length-bytes">>, <<"x-queue-type">>,
                           <<"x-max-age">>, <<"x-stream-max-segment-size-bytes">>,
                           <<"x-initial-cluster-size">>, <<"x-queue-leader-locator">>],
