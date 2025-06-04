@@ -1,68 +1,68 @@
-(function (factory) {
-  if (typeof define === 'function' && define.amd) {
-    define(['jquery', 'sammy'], factory);
-  } else {
-    (window.Sammy = window.Sammy || {}).Title = factory(window.jQuery, window.Sammy);
-  }
-}(function ($, Sammy) {
-
-  // Sammy.Title is a very simple plugin to easily set the document's title.
-  // It supplies a helper for setting the title (`title()`) within routes,
-  // and an app level method for setting the global title (`setTitle()`)
-  Sammy.Title = function() {
-
-    // setTitle allows setting a global title or a function that modifies the
-    // title for each route/page.
-    //
-    // ### Example
-    //
-    //    // setting a title prefix
-    //    $.sammy(function() {
-    //
-    //      this.setTitle('My App -');
-    //
-    //      this.get('#/', function() {
-    //        this.title('Home'); // document's title == "My App - Home"
-    //      });
-    //    });
-    //
-    //    // setting a title with a function
-    //    $.sammy(function() {
-    //
-    //      this.setTitle(function(title) {
-    //        return [title, " /// My App"].join('');
-    //      });
-    //
-    //      this.get('#/', function() {
-    //        this.title('Home'); // document's title == "Home /// My App";
-    //      });
-    //    });
-    //
-    this.setTitle = function(title) {
-      if (!$.isFunction(title)) {
-        this.title_function = function(additional_title) {
-          return [title, additional_title].join(' ');
-        }
-      } else {
-        this.title_function = title;
-      }
-    };
-
-    // *Helper* title() sets the document title, passing it through the function
-    // defined by setTitle() if set.
-    this.helper('title', function() {
-      var new_title = $.makeArray(arguments).join(' ');
-      if (this.app.title_function) {
-        new_title = this.app.title_function(new_title);
-      }
-      document.title = new_title;
-    });
-
-  };
-
-  return Sammy.Title;
-
-}));
+//// (function (factory) {
+////   if (typeof define === 'function' && define.amd) {
+////     define(['jquery', 'sammy'], factory);
+////   } else {
+////     (window.Sammy = window.Sammy || {}).Title = factory(window.jQuery, window.Sammy);
+////   }
+//// }(function ($, Sammy) {
+//// 
+////   // Sammy.Title is a very simple plugin to easily set the document's title.
+////   // It supplies a helper for setting the title (`title()`) within routes,
+////   // and an app level method for setting the global title (`setTitle()`)
+////   Sammy.Title = function() {
+//// 
+////     // setTitle allows setting a global title or a function that modifies the
+////     // title for each route/page.
+////     //
+////     // ### Example
+////     //
+////     //    // setting a title prefix
+////     //    $.sammy(function() {
+////     //
+////     //      this.setTitle('My App -');
+////     //
+////     //      this.get('#/', function() {
+////     //        this.title('Home'); // document's title == "My App - Home"
+////     //      });
+////     //    });
+////     //
+////     //    // setting a title with a function
+////     //    $.sammy(function() {
+////     //
+////     //      this.setTitle(function(title) {
+////     //        return [title, " /// My App"].join('');
+////     //      });
+////     //
+////     //      this.get('#/', function() {
+////     //        this.title('Home'); // document's title == "Home /// My App";
+////     //      });
+////     //    });
+////     //
+////     this.setTitle = function(title) {
+////       if (!$.isFunction(title)) {
+////         this.title_function = function(additional_title) {
+////           return [title, additional_title].join(' ');
+////         }
+////       } else {
+////         this.title_function = title;
+////       }
+////     };
+//// 
+////     // *Helper* title() sets the document title, passing it through the function
+////     // defined by setTitle() if set.
+////     this.helper('title', function() {
+////       var new_title = $.makeArray(arguments).join(' ');
+////       if (this.app.title_function) {
+////         new_title = this.app.title_function(new_title);
+////       }
+////       document.title = new_title;
+////     });
+//// 
+////   };
+//// 
+////   return Sammy.Title;
+//// 
+//// }));
 
 dispatcher_add(function(sammy) {
     function path(p, r, t) {
@@ -71,7 +71,7 @@ dispatcher_add(function(sammy) {
             });
     }
     sammy.get('#/', function() {
-            this.title('Overview');
+            document.title = 'Overview';
             var reqs = {'overview': {path:    '/overview',
                                      options: {ranges: ['lengths-over',
                                                         'msg-rates-over']}},
@@ -82,7 +82,7 @@ dispatcher_add(function(sammy) {
             render(reqs, 'overview', '#/');
         });
     sammy.get('#/', function() {
-        this.title('Overview');
+        document.title = 'Overview';
         var reqs = {'overview': {path:    '/overview',
                                  options: {ranges: ['lengths-over',
                                                     'msg-rates-over']}},
@@ -102,7 +102,7 @@ dispatcher_add(function(sammy) {
         });
 
     sammy.get('#/nodes/:name', function() {
-            this.title('Node ' + this.params['name']);
+            document.title = 'Node ' + this.params['name'];
             var name = esc(this.params['name']);
             render({'node': {path:    '/nodes/' + name,
                              options: {ranges: ['node-stats']}}},
@@ -111,7 +111,7 @@ dispatcher_add(function(sammy) {
 
     if (ac.canAccessVhosts()) {
       sammy.get('#/connections', function() {
-            this.title('Connections');
+            document.title = 'Connections';
             renderConnections();
         });
       sammy.get('#/connections/:name', function() {
@@ -144,7 +144,7 @@ dispatcher_add(function(sammy) {
            return false;
         });
       sammy.get('#/channels', function() {
-            this.title('Channels');
+            document.title = 'RabbitMQ: Channels';
             renderChannels();
         });
       sammy.get('#/channels/:name', function() {
@@ -153,11 +153,11 @@ dispatcher_add(function(sammy) {
                    'channel', '#/channels');
         });
         sammy.get('#/exchanges', function() {
-            this.title('Exchanges');
+            document.title = 'RabbitMQ: Exchanges';
             renderExchanges();
         });
       sammy.get('#/exchanges/:vhost/:name', function() {
-            this.title('Exchange ' + esc(this.params['vhost']) + '/' + this.params['name']);
+            document.title = 'RabbitMQ: Exchange ' + esc(this.params['vhost']) + '/' + this.params['name'];
             var path = '/exchanges/' + esc(this.params['vhost']) + '/' + esc(this.params['name']);
             render({'exchange': {path:    path,
                                  options: {ranges:['msg-rates-x']}},
@@ -181,14 +181,14 @@ dispatcher_add(function(sammy) {
         });
 
       sammy.get('#/queues', function() {
-            this.title('Queues');
+            document.title = 'RabbitMQ: Queues';
             renderQueues();
         });
 
       sammy.get('#/queues/:vhost/:name', function() {
             var vhost = this.params['vhost'];
             var queue = this.params['name'];
-            this.title('Queue ' + esc(vhost) + '/' + queue);
+            document.title = 'RabbitMQ: Queue ' + esc(vhost) + '/' + queue;
             var path = '/queues/' + esc(vhost) + '/' + esc(queue);
             var requests = {'queue': {path:    path,
                                       options: {ranges:['lengths-q', 'msg-rates-q', 'data-rates-q']}},
@@ -273,7 +273,7 @@ dispatcher_add(function(sammy) {
         });
 
       sammy.get('#/users', function() {
-          this.title('Users');
+          document.title = 'RabbitMQ: Users';
           renderUsers();
       });
       sammy.get('#/users/:id', function() {
@@ -338,7 +338,7 @@ dispatcher_add(function(sammy) {
                         'operator_policies': '/operator-policies',
                         'vhosts':   '/vhosts'}, 'policies');
       sammy.get('#/policies/:vhost/:id', function() {
-            this.title('Policies');
+            document.title = 'RabbitMQ: Policies';
             render({'policy': '/policies/' + esc(this.params['vhost'])
                         + '/' + esc(this.params['id'])},
                 'policy', '#/policies');

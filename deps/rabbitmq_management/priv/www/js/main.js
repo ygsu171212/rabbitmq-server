@@ -74,8 +74,9 @@ function dispatcher_add(fun) {
 }
 
 function dispatcher() {
-    this.use('Title');
-    this.setTitle('RabbitMQ: ');
+    // this.use('Title');
+    // this.setTitle('RabbitMQ: ');
+    document.title = 'RabbitMQ: ';
     for (var i in dispatcher_modules) {
         dispatcher_modules[i](this);
     }
